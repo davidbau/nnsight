@@ -29,7 +29,7 @@ class Proxy:
             value2 (Any): Collection with Tensors to pull values from.
         """
         if isinstance(value1, torch.Tensor):
-            value1[:] = value2
+            value1.data[:] = value2
         elif isinstance(value1, list) or isinstance(value1, tuple):
             for value_idx in range(len(value1)):
                 Proxy.proxy_update(value1[value_idx], value2[value_idx])
