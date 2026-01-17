@@ -7,6 +7,7 @@ from typing_extensions import Self
 
 from ...intervention.backends import Backend
 from ...intervention.backends.remote import RemoteBackend
+from ...intervention.backends.local_simulation import LocalSimulationBackend
 from ...intervention.serialization import load, save
 from ...intervention.tracing.tracer import InterleavingTracer, Tracer
 from ...util import from_import_path, to_import_path
@@ -19,13 +20,15 @@ class RemoteableMixin(MetaMixin):
         self,
         *inputs: Any,
         backend: Union[Backend, str, None] = None,
-        remote: bool = False,
+        remote: Union[bool, str] = False,
         blocking: bool = True,
         **kwargs: Dict[str, Any],
     ):
 
         if backend is not None:
             pass
+        elif remote == 'local':
+            backend = LocalSimulationBackend(self)
         elif remote:
             backend = RemoteBackend(self.to_model_key(), blocking=blocking)
         # If backend is a string, assume RemoteBackend url.
