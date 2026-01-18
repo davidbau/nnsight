@@ -31,7 +31,7 @@ classifiers = [
 dependencies = [
     "transformers",
     "astor", 
-    "cloudpickle",
+    "cloudpickle @ git+https://github.com/davidbau/cloudpickle.git@source-serial",
     "httpx",
     "python-socketio[client]",
     "pydantic>=2.9.0",

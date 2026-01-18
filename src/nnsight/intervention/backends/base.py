@@ -56,11 +56,11 @@ class Backend:
 
         # STEP 3: Join all source lines into a single string for compilation
         source_code = "".join(tracer.info.source)
-        
+
         # STEP 4: Compile the source code into a Python code object
         # Use the tracer's filename for better error reporting and debugging
         code_obj = compile(source_code, tracer.info.filename, "exec")
-        
+
         # STEP 5: Create a local namespace for function execution
         local_namespace = {}
 
@@ -75,5 +75,10 @@ class Backend:
         # STEP 7: Extract the compiled function from the local namespace
         # The function should be the last (and likely only) value added to the namespace
         compiled_function = list(local_namespace.values())[-1]
-        
+
+        # STEP 8: Attach source code for serialization
+        # Since this function was dynamically compiled, inspect.getsource() won't work.
+        # Attach the source explicitly so source-based serializers can find it.
+        compiled_function.__source__ = source_code
+
         return compiled_function
