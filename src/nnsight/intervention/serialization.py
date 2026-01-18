@@ -37,6 +37,7 @@ import inspect
 import io
 import pickle
 import textwrap
+import tokenize
 import types
 from pathlib import Path
 from typing import Any, BinaryIO, Optional, Union
@@ -165,6 +166,145 @@ def _patched_should_pickle_by_reference(obj, name=None):
 _cloudpickle_internal._should_pickle_by_reference = _patched_should_pickle_by_reference
 
 
+def _extract_lambda_source(source: str, code: types.CodeType) -> str:
+    """Extract a specific lambda's source when multiple lambdas share a line.
+
+    Uses co_positions() (Python 3.11+) to find column offset and tokenization
+    to extract just the target lambda. Falls back to full source on older Python.
+
+    This handles tricky cases like:
+    - Multiple lambdas on same line: f, g = lambda x: x*2, lambda x: x+1
+    - Nested lambdas: lambda x: lambda y: x + y
+    - Lambdas with lambda defaults: lambda x=lambda: 1: x()
+    - Multi-line lambdas (automatically wrapped in parentheses)
+
+    Args:
+        source: The full source code containing the lambda (from inspect.getsource).
+        code: The code object of the lambda function.
+
+    Returns:
+        The extracted source for just this specific lambda, or the original
+        source if extraction fails or isn't needed.
+    """
+    if code.co_name != "<lambda>" or not hasattr(code, "co_positions"):
+        return source
+
+    # Find first meaningful position (skip entries with zero columns)
+    target_line = target_col = None
+    for line, _, col, end_col in code.co_positions():
+        if col or end_col:
+            target_line, target_col = line, col
+            break
+    if target_line is None:
+        return source
+
+    # Adjust to source-relative coordinates
+    source_line = target_line - code.co_firstlineno + 1
+
+    # Tokenize source
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(source).readline))
+    except tokenize.TokenizeError:
+        return source
+
+    # Find each lambda and its body-start position (the colon).
+    # co_positions points to the body, so we need the lambda whose colon
+    # is closest to but before the target position.
+    best_lambda_idx = None
+    best_colon_col = -1
+
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok.type == tokenize.NAME and tok.string == "lambda":
+            # Find this lambda's body colon, skipping nested lambdas and structures
+            depth = 0
+            lambda_depth = 0
+            for j in range(i + 1, len(tokens)):
+                t = tokens[j]
+                if t.type == tokenize.NAME and t.string == "lambda":
+                    lambda_depth += 1
+                elif t.type == tokenize.OP:
+                    if t.string in "([{":
+                        depth += 1
+                    elif t.string in ")]}":
+                        depth -= 1
+                    elif t.string == ":" and depth == 0:
+                        if lambda_depth > 0:
+                            # This colon belongs to a nested lambda
+                            lambda_depth -= 1
+                        else:
+                            # This is our lambda's body colon
+                            colon_line, colon_col = t.start
+                            if colon_line < source_line or (
+                                colon_line == source_line and colon_col < target_col
+                            ):
+                                if colon_col > best_colon_col:
+                                    best_lambda_idx = i
+                                    best_colon_col = colon_col
+                            break
+        i += 1
+
+    if best_lambda_idx is None:
+        return source
+
+    # Find end of lambda: comma/colon at depth 0 in body, closing paren, or newline.
+    # A colon after the body starts indicates an enclosing lambda's body separator.
+    idx = best_lambda_idx
+    depth = 0
+    lambda_depth = 0
+    past_colon = False
+    end_idx = idx
+    for j in range(idx + 1, len(tokens)):  # Start after our lambda keyword
+        t = tokens[j]
+        if t.type == tokenize.NAME and t.string == "lambda":
+            lambda_depth += 1
+        elif t.type == tokenize.OP:
+            if t.string == ":" and depth == 0:
+                if lambda_depth > 0:
+                    lambda_depth -= 1
+                elif past_colon:
+                    # Second colon at depth 0 - enclosing lambda's body
+                    end_idx = j - 1
+                    break
+                else:
+                    past_colon = True
+            elif t.string in "([{":
+                depth += 1
+            elif t.string in ")]}":
+                if depth == 0:
+                    end_idx = j - 1
+                    break
+                depth -= 1
+            elif t.string == "," and depth == 0 and past_colon:
+                end_idx = j - 1
+                break
+        elif t.type in (tokenize.NEWLINE, tokenize.ENDMARKER):
+            end_idx = j - 1
+            break
+        end_idx = j
+
+    # Extract source span
+    start, end = tokens[idx], tokens[end_idx]
+    lines = source.splitlines(keepends=True)
+    if start.start[0] == end.end[0]:
+        return lines[start.start[0] - 1][start.start[1]:end.end[1]]
+    parts = []
+    for n in range(start.start[0], end.end[0] + 1):
+        line = lines[n - 1]
+        if n == start.start[0]:
+            parts.append(line[start.start[1]:])
+        elif n == end.end[0]:
+            parts.append(line[:end.end[1]])
+        else:
+            parts.append(line)
+    result = "".join(parts)
+    # Multi-line lambdas need parentheses to be syntactically valid
+    if "\n" in result:
+        result = "(" + result + ")"
+    return result
+
+
 def make_function(
     source: str,
     name: str,
@@ -235,9 +375,17 @@ def make_function(
         # (including any self-references) ARE deferred to the state setter.
         closure_params = ", ".join(closure_names)
         factory_source = f"def _seri_factory_({closure_params}):\n"
-        indented_source = textwrap.indent(source, "    ")
-        factory_source += indented_source + "\n"
-        factory_source += f"    return {name}\n"
+
+        # Lambdas have '<lambda>' as their name, which is not valid Python syntax.
+        # We handle them by assigning the lambda expression to a temporary variable.
+        if name == "<lambda>":
+            indented_source = "    _lambda_result_ = " + source + "\n"
+            factory_source += indented_source
+            factory_source += "    return _lambda_result_\n"
+        else:
+            indented_source = textwrap.indent(source, "    ")
+            factory_source += indented_source + "\n"
+            factory_source += f"    return {name}\n"
 
         # Compile and execute the factory, then call it with closure values
         try:
@@ -266,12 +414,14 @@ def make_function(
                 f"This may indicate corrupted serialized data or version incompatibility."
             ) from e
 
-        # Search through the module's constants to find our function's code object
+        # Search through the module's constants to find our function's code object.
+        # For lambdas with nested lambdas as defaults, multiple code objects have
+        # co_name=="<lambda>". The outermost lambda is last, so don't break early.
         func_code = None
         for const in module_code.co_consts:
             if isinstance(const, types.CodeType) and const.co_name == name:
                 func_code = const
-                break
+                # Don't break for lambdas - we want the last (outermost) one
 
         if func_code is None:
             raise ValueError(f"Could not find function '{name}' in compiled source")
@@ -422,6 +572,8 @@ class CustomCloudPickler(cloudpickle.Pickler):
                     f"Cannot serialize function '{func.__name__}': source code unavailable. "
                     f"Attach source manually via func.__source__ = '...'. Original error: {e}"
                 ) from e
+            # For lambdas, extract just this lambda when multiple share a line
+            source = _extract_lambda_source(source, func.__code__)
 
         # Use cloudpickle's internal helper to extract function state.
         # _function_getstate returns:
