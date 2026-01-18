@@ -21,7 +21,7 @@ class RequestModel(BaseModel):
 
     
     def serialize(self, _zlib:bool) -> bytes:
-                
+
         data = save(self)
                 
         if _zlib:
