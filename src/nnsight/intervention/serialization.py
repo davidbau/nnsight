@@ -42,10 +42,125 @@ from pathlib import Path
 from typing import Any, BinaryIO, Optional, Union
 
 import cloudpickle
+import cloudpickle.cloudpickle as _cloudpickle_internal
 from cloudpickle.cloudpickle import _function_getstate, _get_cell_contents
 
 # Default pickle protocol - protocol 4 is available in Python 3.4+ and supports large objects
 DEFAULT_PROTOCOL = 4
+
+# =============================================================================
+# Module Whitelist Configuration
+# =============================================================================
+#
+# Only modules in this whitelist are assumed to be available on the server.
+# Functions and classes from non-whitelisted modules will be serialized by
+# source code (pickle-by-value) rather than by reference.
+#
+# This ensures that user-defined modules are automatically captured without
+# requiring explicit register() calls.
+
+SERVER_MODULES_WHITELIST = frozenset({
+    # Python standard library (commonly used)
+    "abc", "ast", "base64", "builtins", "collections", "contextlib",
+    "copy", "dataclasses", "datetime", "decimal", "enum", "functools",
+    "hashlib", "heapq", "io", "itertools", "json", "logging", "math",
+    "operator", "os", "pathlib", "pickle", "random", "re", "secrets",
+    "statistics", "string", "struct", "sys", "threading", "time",
+    "typing", "typing_extensions", "unittest", "uuid", "warnings",
+    "weakref", "zlib",
+    # Core ML/scientific packages
+    "torch", "numpy", "np", "scipy",
+    # HuggingFace ecosystem
+    "transformers", "tokenizers", "accelerate", "datasets", "huggingface_hub",
+    "safetensors", "peft",
+    # nnsight itself
+    "nnsight",
+    # Common utilities
+    "tqdm", "einops", "packaging",
+})
+
+
+def _is_whitelisted_module(module_name: str) -> bool:
+    """Check if a module is in the server whitelist.
+
+    A module is considered whitelisted if it or any of its parent packages
+    are in the whitelist. For example, if 'torch' is whitelisted, then
+    'torch.nn' and 'torch.nn.functional' are also whitelisted.
+
+    Args:
+        module_name: The fully qualified module name (e.g., 'torch.nn.functional')
+
+    Returns:
+        True if the module is whitelisted, False otherwise.
+    """
+    if module_name is None:
+        return False
+    if not isinstance(module_name, str):
+        return False
+    # Fast path: check if the top-level package is whitelisted
+    dot_idx = module_name.find(".")
+    if dot_idx == -1:
+        top_level = module_name
+    else:
+        top_level = module_name[:dot_idx]
+    return top_level in SERVER_MODULES_WHITELIST
+
+
+# Store the original function for potential restoration
+_original_should_pickle_by_reference = _cloudpickle_internal._should_pickle_by_reference
+
+# Thread-local recursion guard to prevent infinite recursion
+import threading
+_recursion_guard = threading.local()
+
+
+def _patched_should_pickle_by_reference(obj, name=None):
+    """Patched version that only pickles by reference for whitelisted modules.
+
+    This overrides cloudpickle's default behavior which pickles by reference
+    for any importable module. Instead, we only pickle by reference for modules
+    known to be available on the server (the whitelist).
+
+    Non-whitelisted modules are pickled by value (source code), which triggers
+    the CustomCloudPickler._dynamic_function_reduce method for source-based
+    serialization.
+    """
+    # Recursion guard - if we're already checking, defer to original
+    if getattr(_recursion_guard, 'checking', False):
+        return _original_should_pickle_by_reference(obj, name)
+
+    _recursion_guard.checking = True
+    try:
+        if isinstance(obj, types.FunctionType):
+            # For functions, check the module they're defined in
+            module_and_name = _cloudpickle_internal._lookup_module_and_qualname(obj, name=name)
+            if module_and_name is None:
+                return False
+            module, _ = module_and_name
+            module_name = getattr(module, "__name__", None)
+            return _is_whitelisted_module(module_name)
+        elif isinstance(obj, type):
+            # For classes, check the module they're defined in
+            module_and_name = _cloudpickle_internal._lookup_module_and_qualname(obj, name=name)
+            if module_and_name is None:
+                return False
+            module, _ = module_and_name
+            module_name = getattr(module, "__name__", None)
+            return _is_whitelisted_module(module_name)
+        elif isinstance(obj, types.ModuleType):
+            # For module objects, check the module name directly
+            return _is_whitelisted_module(obj.__name__)
+        else:
+            raise TypeError(
+                f"_patched_should_pickle_by_reference cannot check "
+                f"importability of {type(obj).__name__} instances"
+            )
+    finally:
+        _recursion_guard.checking = False
+
+
+# Apply the patch at module load time
+_cloudpickle_internal._should_pickle_by_reference = _patched_should_pickle_by_reference
 
 
 def make_function(
