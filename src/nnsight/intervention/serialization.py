@@ -61,10 +61,10 @@ DEFAULT_PROTOCOL = 4
 
 SERVER_MODULES_WHITELIST = frozenset({
     # Python standard library (commonly used)
-    "abc", "ast", "base64", "builtins", "collections", "contextlib",
-    "copy", "dataclasses", "datetime", "decimal", "enum", "functools",
-    "hashlib", "heapq", "io", "itertools", "json", "logging", "math",
-    "operator", "os", "pathlib", "pickle", "random", "re", "secrets",
+    "abc", "ast", "asyncio", "_asyncio", "base64", "builtins", "collections",
+    "contextlib", "copy", "dataclasses", "datetime", "decimal", "enum",
+    "functools", "hashlib", "heapq", "io", "itertools", "json", "logging",
+    "math", "operator", "os", "pathlib", "pickle", "random", "re", "secrets",
     "statistics", "string", "struct", "sys", "threading", "time",
     "typing", "typing_extensions", "unittest", "uuid", "warnings",
     "weakref", "zlib",
@@ -77,6 +77,8 @@ SERVER_MODULES_WHITELIST = frozenset({
     "nnsight",
     # Common utilities
     "tqdm", "einops", "packaging",
+    # Serialization (cloudpickle is used internally and must be whitelisted)
+    "cloudpickle",
 })
 
 
@@ -173,8 +175,8 @@ def make_function(
     annotations: Optional[dict],
     defaults: Optional[tuple],
     kwdefaults: Optional[dict],
-    globals_dict: dict,
-    closure: Optional[list],
+    base_globals: dict,
+    closure_values: Optional[list],
     closure_names: Optional[list],
 ) -> types.FunctionType:
     """Reconstruct a function from its serialized source code and metadata.
@@ -182,6 +184,12 @@ def make_function(
     This is the deserialization counterpart to CustomCloudPickler's function
     serialization. It recompiles source code and reconstructs the function
     with all its original attributes (defaults, annotations, closure, etc.).
+
+    This function creates the function with minimal globals. The full globals
+    (including any self-references for recursive functions) are applied later
+    by _source_function_setstate, which is called after pickle memoizes the
+    function. This two-phase approach enables proper handling of circular
+    references like recursive or mutually recursive functions.
 
     Args:
         source: The function's source code as a string. May be indented.
@@ -194,32 +202,27 @@ def make_function(
         annotations: Type annotations dict (__annotations__).
         defaults: Default values for positional arguments (__defaults__).
         kwdefaults: Default values for keyword-only arguments (__kwdefaults__).
-        globals_dict: Global variables the function needs access to. These are
-            captured during serialization and restored here.
-        closure: List of closure variable values (the actual values, not cells).
-        closure_names: List of closure variable names (co_freevars). Must match
-            the order and length of `closure`.
+        base_globals: Minimal global variables dict. Full globals including
+            self-references are added later by _source_function_setstate.
+        closure_values: List of closure variable values (passed immediately, not
+            deferred, because closures need factory pattern to bind properly).
+        closure_names: List of closure variable names (co_freevars).
 
     Returns:
-        A newly constructed function object equivalent to the original.
+        A newly constructed function object. Note: the globals are minimal
+        at this point - they're filled in by _source_function_setstate.
 
     Raises:
         ValueError: If the function name cannot be found in the compiled source.
-
-    Note:
-        For functions with closures, we use a factory function pattern to properly
-        bind closure variables. This is necessary because Python's closure mechanism
-        requires variables to be captured from an enclosing scope - we can't just
-        assign them directly to a code object.
     """
     # Remove any leading indentation (e.g., if function was defined inside a class)
     source = textwrap.dedent(source)
 
     # Set up the global namespace for the reconstructed function.
-    # We need __builtins__ for the function to access built-in functions.
-    func_globals = {"__builtins__": __builtins__, **globals_dict}
+    # This is a minimal globals dict - full globals are added by _source_function_setstate.
+    func_globals = {"__builtins__": __builtins__, **base_globals}
 
-    if closure and closure_names:
+    if closure_values and closure_names:
         # CLOSURE HANDLING: Functions with closures require special treatment.
         #
         # Python closures work by capturing variables from enclosing scopes.
@@ -227,19 +230,9 @@ def make_function(
         # wrap the function definition inside another function that takes the
         # closure values as parameters, then call it to create the real function.
         #
-        # Example: if original was:
-        #     def outer():
-        #         x = 10
-        #         def inner(y):
-        #             return x + y
-        #         return inner
-        #
-        # We generate:
-        #     def _seri_factory_(x):
-        #         def inner(y):
-        #             return x + y
-        #         return inner
-        #     func = _seri_factory_(10)
+        # Note: closure values are bound here (not deferred) because the factory
+        # pattern requires them at function creation time. However, the globals
+        # (including any self-references) ARE deferred to the state setter.
         closure_params = ", ".join(closure_names)
         factory_source = f"def _seri_factory_({closure_params}):\n"
         indented_source = textwrap.indent(source, "    ")
@@ -258,12 +251,13 @@ def make_function(
             ) from e
         exec(factory_code, func_globals)
         factory = func_globals["_seri_factory_"]
-        func = factory(*closure)
+        func = factory(*closure_values)
+
+        # The factory path doesn't preserve defaults, so restore them
+        if defaults:
+            func.__defaults__ = tuple(defaults)
     else:
-        # NO CLOSURE: Simpler path - compile source and extract the code object.
-        #
-        # We compile the entire source as a module, then find the specific
-        # function's code object in the module's constants.
+        # NO CLOSURE: Compile source directly and extract the code object.
         try:
             module_code = compile(source, filename or "<serialization>", "exec")
         except SyntaxError as e:
@@ -285,13 +279,7 @@ def make_function(
         # Create the function directly from the code object
         func = types.FunctionType(func_code, func_globals, name, defaults, None)
 
-    # RESTORE FUNCTION METADATA
-    #
-    # The factory path above doesn't preserve defaults (they become regular
-    # parameters in the factory), so we need to restore them explicitly.
-    if closure and closure_names and defaults:
-        func.__defaults__ = tuple(defaults)
-
+    # Restore function metadata
     if kwdefaults:
         func.__kwdefaults__ = kwdefaults
 
@@ -303,7 +291,63 @@ def make_function(
     func.__doc__ = doc
     func.__qualname__ = qualname
 
+    # Attach original source for re-serialization (inspect.getsource won't work
+    # because line numbers don't match the original file)
+    func.__source__ = source
+
     return func
+
+
+def _source_function_setstate(func: types.FunctionType, state: tuple) -> None:
+    """Update the state of a source-serialized function after memoization.
+
+    This is called by pickle after the function has been created and memoized.
+    It updates the function's globals with the full captured values, including
+    any self-references (for recursive functions) or cross-references (for
+    mutually recursive functions).
+
+    This two-phase approach (create minimal function, then fill in state) is
+    essential for handling circular references. By the time this function is
+    called, the function object is already in pickle's memo, so any references
+    to it in the state (like self-references in globals) resolve correctly.
+
+    For local recursive functions (where the self-reference is in a closure
+    variable rather than globals), we also fill in deferred closure cells here.
+
+    Args:
+        func: The function to update (already created by make_function).
+        state: A tuple of (func_dict, slotstate) where:
+            - func_dict: Custom attributes to add to func.__dict__
+            - slotstate: Dict with keys:
+                - "__globals__": Full captured globals to merge into func.__globals__
+                - "__deferred_closure__": Dict mapping closure cell indices to the
+                  function objects that should fill those cells (handles both
+                  self-references and cross-references for mutual recursion)
+    """
+    func_dict, slotstate = state
+
+    # Update func.__dict__ with any custom attributes
+    func.__dict__.update(func_dict)
+
+    # Get the full globals from state
+    full_globals = slotstate.get("__globals__", {})
+
+    # Update globals in place - this is the key to handling self-references!
+    # The function is already memoized, so any self-reference in full_globals
+    # now points to the existing (memoized) function object.
+    func.__globals__.update(full_globals)
+
+    # Fill in deferred closure cells (for local recursive/mutually recursive functions).
+    # These are closure cells containing function references that were replaced
+    # with None placeholders during serialization to avoid infinite recursion.
+    # Now that all functions are memoized, we can safely fill them in.
+    deferred_closure = slotstate.get("__deferred_closure__", {})
+    if deferred_closure and func.__closure__ is not None:
+        for idx_str, target_func in deferred_closure.items():
+            # The index might be a string if it came through JSON-like serialization
+            idx = int(idx_str) if isinstance(idx_str, str) else idx_str
+            # Fill in the function reference (could be self or another function)
+            func.__closure__[idx].cell_contents = target_func
 
 
 class CustomCloudPickler(cloudpickle.Pickler):
@@ -334,16 +378,30 @@ class CustomCloudPickler(cloudpickle.Pickler):
         (functions defined at runtime or in __main__). We override it to capture
         source code instead of bytecode.
 
+        The serialization uses pickle's 6-tuple reduce protocol with a state setter
+        to properly handle circular references (like recursive functions). The
+        pattern is:
+            1. make_function creates a function with minimal globals and empty closures
+            2. Pickle memoizes the function object
+            3. _source_function_setstate fills in the full globals and closure values
+
+        This deferred state application is essential because the full globals may
+        contain references to the function itself (for recursive functions) or to
+        other functions that reference this one (for mutual recursion). By the time
+        the state setter runs, the function is already memoized, so these references
+        resolve correctly.
+
         Args:
             func: The function to serialize.
 
         Returns:
-            A 5-tuple for pickle's reduce protocol:
+            A 6-tuple for pickle's reduce protocol:
                 - Callable to reconstruct the function (make_function)
-                - Args tuple for that callable
-                - State dict (func.__dict__ minus __source__)
+                - Args tuple with minimal state (source, metadata, empty closures)
+                - State tuple (func_dict, slotstate with full globals/closure)
                 - None (for list items, unused)
                 - None (for dict items, unused)
+                - State setter function (_source_function_setstate)
 
         Note:
             If the function has a __source__ attribute (manually attached),
@@ -367,57 +425,86 @@ class CustomCloudPickler(cloudpickle.Pickler):
 
         # Use cloudpickle's internal helper to extract function state.
         # _function_getstate returns:
-        #   - state: func.__dict__ (custom attributes)
+        #   - func_dict: func.__dict__ (custom attributes)
         #   - slotstate: dict of function slots (__globals__, __defaults__, etc.)
-        state, slotstate = _function_getstate(func)
+        func_dict, slotstate = _function_getstate(func)
 
-        # Extract all the metadata we need to reconstruct the function
-        func_globals_captured = slotstate["__globals__"]
+        # Remove __source__ from func_dict since we handle it separately
+        func_dict = {k: v for k, v in func_dict.items() if k != "__source__"}
+
+        # Extract metadata for the args tuple
+        name = slotstate["__name__"]
         defaults = slotstate["__defaults__"]
         kwdefaults = slotstate["__kwdefaults__"]
         annotations = slotstate["__annotations__"]
-        name = slotstate["__name__"]
         filename = func.__code__.co_filename
         qualname = slotstate["__qualname__"]
-        module = slotstate["__module__"]
+        module_name = slotstate["__module__"]
         doc = slotstate["__doc__"]
-        closure = slotstate["__closure__"]
 
-        # Convert closure cells to their actual values.
-        # Closure cells are wrapper objects; we need the contained values.
-        if closure:
-            closure = [_get_cell_contents(cell) for cell in closure]
+        # BASE GLOBALS: Minimal globals for function creation.
+        # Following cloudpickle's pattern, we only include module identity attrs.
+        # The full globals (including any self-references) go in the state and
+        # are applied AFTER memoization by _source_function_setstate.
+        base_globals = {}
+        func_globals = func.__globals__
+        for k in ["__package__", "__name__", "__path__", "__file__"]:
+            if k in func_globals:
+                base_globals[k] = func_globals[k]
+
+        # CLOSURE: Extract closure values and names.
+        # For recursive/mutually recursive local functions, the closure may contain
+        # function references that create cycles. We defer ALL function values in
+        # closures to the state setter, which runs after memoization. This allows
+        # pickle's memo to break the cycle.
+        deferred_closure = {}  # Maps index -> function to fill in after memoization
+        if func.__closure__ is not None:
+            closure_names = list(func.__code__.co_freevars)
+            closure_values = []
+            for i, cell in enumerate(func.__closure__):
+                value = _get_cell_contents(cell)
+                if isinstance(value, types.FunctionType):
+                    # Defer ALL functions to state setter to handle cycles.
+                    # This includes self-references and cross-references.
+                    closure_values.append(None)  # Placeholder
+                    deferred_closure[i] = value
+                else:
+                    closure_values.append(value)
         else:
-            closure = None
+            closure_values = None
+            closure_names = None
 
-        # Get the names of closure variables from the code object.
-        # These are needed to properly rebind the closure during deserialization.
-        closure_names = (
-            list(func.__code__.co_freevars) if func.__code__.co_freevars else None
-        )
+        # STATE: Full globals and deferred closure info, applied after memoization.
+        # This is where self-references and cross-references live - by the time
+        # _source_function_setstate is called, the function is already memoized,
+        # so these references resolve correctly.
+        state_slotstate = {
+            "__globals__": slotstate["__globals__"],
+            "__deferred_closure__": deferred_closure,  # Maps indices to target functions
+        }
+        state = (func_dict, state_slotstate)
 
-        # Preserve custom attributes from func.__dict__, but exclude __source__
-        # since we've already captured that separately.
-        func_dict = {k: v for k, v in state.items() if k != "__source__"}
-
-        # Return the reduce tuple for pickle protocol.
-        # When unpickling, pickle will call: make_function(*args)
-        # then update the result's __dict__ with func_dict.
+        # Args for make_function - creates function with minimal globals.
+        # Closure values are passed here (not deferred) because the factory
+        # pattern needs them at function creation time.
         args = (
             source,
             name,
             filename,
             qualname,
-            module,
+            module_name,
             doc,
             annotations,
             defaults,
             kwdefaults,
-            func_globals_captured,
-            closure,
+            base_globals,
+            closure_values,
             closure_names,
         )
-        return (make_function, args, func_dict, None, None)
+
+        # Return 6-tuple: (func, args, state, listitems, dictitems, state_setter)
+        # The state_setter is called AFTER memoization to fill in full globals/closure
+        return (make_function, args, state, None, None, _source_function_setstate)
 
     def persistent_id(self, obj: Any) -> Optional[Any]:
         """Return a persistent ID for objects that shouldn't be fully serialized.
