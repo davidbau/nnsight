@@ -19,6 +19,7 @@ SERVER_MODULES = {
     'torch', 'numpy', 'transformers', 'accelerate', 'einops',
     'collections', 'itertools', 'functools', 'operator', 'math',
     'random', 'json', 're', 'typing', 'dataclasses', 'abc',
+    'cloudpickle',  # Required for deserializing source-based functions
 }
 
 
