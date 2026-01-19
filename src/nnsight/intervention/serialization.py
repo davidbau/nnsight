@@ -68,8 +68,6 @@ SERVER_MODULES_WHITELIST = frozenset({
     "nnsight",
     # Common utilities
     "tqdm", "einops", "packaging",
-    # Serialization (cloudpickle is used internally and must be whitelisted)
-    "cloudpickle",
 })
 
 # =============================================================================
