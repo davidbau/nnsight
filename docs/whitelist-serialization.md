@@ -5,7 +5,7 @@
 
 ## Goal
 
-Automatically serialize user-defined functions by source code without requiring explicit registration. Previously, users had to call `register(mymodule)` for their code to work with remote execution. This commit eliminates that requirement.
+Automatically serialize user-defined functions by source code without requiring explicit registration. Previously, cloudpickle's `register_pickle_by_value(mymodule)` had to be called for user code to work with remote execution. The whitelist approach eliminates that requirement.
 
 ## Design
 
@@ -80,17 +80,8 @@ def _is_whitelisted_module(module_name: str) -> bool:
 
 ## Usage
 
-Before (required explicit registration):
-```python
-from nnsight.ndif import register
-import mymethods
-register(mymethods)
+User-defined modules are automatically serialized by source - no registration needed:
 
-with model.trace("Hello", remote=True):
-    hidden = mymethods.normalize(model.transformer.h[0].output[0])
-```
-
-After (automatic):
 ```python
 import mymethods
 
@@ -98,6 +89,8 @@ with model.trace("Hello", remote=True):
     hidden = mymethods.normalize(model.transformer.h[0].output[0])
     # Just works! mymethods is automatically serialized by source
 ```
+
+Previously, cloudpickle's `register_pickle_by_value()` had to be called explicitly for each user module. The whitelist approach eliminates this requirement.
 
 ## Limitations
 
