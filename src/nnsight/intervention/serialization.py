@@ -33,6 +33,7 @@ from types import FrameType
 from typing import Any, Optional, Union
 
 import cloudpickle
+from cloudpickle import PicklingProhibitedError
 
 from ..util import Patcher, Patch
 from .envoy import Envoy
@@ -52,14 +53,12 @@ DEFAULT_PROTOCOL = 4
 # requiring explicit register() calls.
 
 SERVER_MODULES_WHITELIST = frozenset({
-    # Python standard library (commonly used)
-    "abc", "ast", "asyncio", "_asyncio", "base64", "builtins", "collections",
-    "contextlib", "copy", "dataclasses", "datetime", "decimal", "enum",
-    "functools", "hashlib", "heapq", "io", "itertools", "json", "logging",
-    "math", "operator", "os", "pathlib", "pickle", "random", "re", "secrets",
-    "statistics", "string", "struct", "sys", "threading", "time",
-    "typing", "typing_extensions", "unittest", "uuid", "warnings",
-    "weakref", "zlib",
+    # Python standard library (commonly used, safe for remote execution)
+    "abc", "ast", "base64", "collections", "contextlib", "copy",
+    "dataclasses", "datetime", "decimal", "enum", "functools", "hashlib",
+    "heapq", "itertools", "json", "logging", "math", "operator", "random",
+    "re", "secrets", "statistics", "string", "struct", "time", "typing",
+    "typing_extensions", "unittest", "uuid", "warnings", "weakref", "zlib",
     # Core ML/scientific packages
     "torch", "numpy", "np", "scipy",
     # HuggingFace ecosystem
@@ -73,13 +72,212 @@ SERVER_MODULES_WHITELIST = frozenset({
     "cloudpickle",
 })
 
+# =============================================================================
+# Module Blacklist Configuration (Lint-time Safety Check)
+# =============================================================================
+#
+# Modules in this blacklist will raise PicklingProhibitedError when code
+# directly references them. This is an early warning system (like a linter)
+# to catch common dangerous patterns before code is sent to the server.
+#
+# This is NOT a complete sandbox - real sandboxing happens server-side.
+# This lint check only catches direct module references in function globals:
+#   - `import os; os.getcwd()` - CAUGHT (os is in function globals)
+#   - `from os import getcwd; getcwd()` - CAUGHT (getcwd is in function globals)
+#   - `def f(): import os; ...` - NOT caught (import inside function)
+#   - `open(...)`, `eval(...)` - NOT caught (builtins resolved at runtime)
+#
+# The goal is to give users helpful early feedback, not to prevent all
+# possible dangerous operations.
+
+PROHIBITED_MODULES = frozenset({
+    # ==========================================================================
+    # Process execution - can run arbitrary commands on the server
+    # ==========================================================================
+    "subprocess",       # subprocess.Popen, subprocess.call, etc.
+    "os",               # os.system, os.popen, os.spawn*, os.exec*, os.fork
+    "pty",              # pty.spawn - can spawn shells
+    "commands",         # Deprecated but dangerous (Python 2)
+    "popen2",           # Deprecated but dangerous (Python 2)
+
+    # ==========================================================================
+    # File system access - can read/write/delete files on server
+    # ==========================================================================
+    "shutil",           # File operations: copy, move, delete, rmtree
+    "pathlib",          # Path manipulation and file operations
+    "glob",             # File globbing
+    "fnmatch",          # Filename matching
+    "tempfile",         # Creates temporary files
+    "fileinput",        # File input operations
+    "filecmp",          # File comparisons
+    "linecache",        # Can read arbitrary files
+    "io",               # Low-level I/O operations
+    "_io",              # C implementation of io (includes open())
+
+    # ==========================================================================
+    # Archive extraction - can write files anywhere (path traversal attacks)
+    # ==========================================================================
+    "tarfile",          # Tar archives (CVE path traversal risks)
+    "zipfile",          # Zip archives (path traversal, zip bombs)
+    "gzip",             # Gzip compression/decompression
+    "bz2",              # Bzip2 compression/decompression
+    "lzma",             # LZMA compression/decompression
+    "zipimport",        # Import from zip files
+
+    # ==========================================================================
+    # Network access - can make connections, exfiltrate data
+    # ==========================================================================
+    "socket",           # Raw socket access
+    "_socket",          # C implementation of socket
+    "ssl",              # SSL/TLS (requires socket)
+    "http",             # HTTP client/server
+    "urllib",           # URL handling and fetching
+    "ftplib",           # FTP client
+    "smtplib",          # SMTP client (email)
+    "poplib",           # POP3 client (email)
+    "imaplib",          # IMAP client (email)
+    "nntplib",          # NNTP client (news)
+    "telnetlib",        # Telnet client
+    "xmlrpc",           # XML-RPC
+
+    # ==========================================================================
+    # Code execution - can execute arbitrary code
+    # ==========================================================================
+    "code",             # Interactive interpreter
+    "codeop",           # Code compilation
+    "compileall",       # Compile Python files
+    "py_compile",       # Compile Python files
+    "runpy",            # Run Python modules
+    "importlib",        # Dynamic imports
+    "imp",              # Deprecated import machinery
+    "pkgutil",          # Package utilities (can import)
+
+    # ==========================================================================
+    # Serialization - can execute arbitrary code on deserialize
+    # ==========================================================================
+    "pickle",           # Arbitrary code execution on load
+    "shelve",           # Uses pickle internally
+    "marshal",          # Similar risks to pickle
+    "dill",             # Extended pickle
+
+    # ==========================================================================
+    # System manipulation - can affect server state
+    # ==========================================================================
+    "sys",              # sys.exit, sys.path manipulation, etc.
+    "signal",           # Signal handling
+    "atexit",           # Exit handlers
+    "threading",        # Thread creation
+    "multiprocessing",  # Process creation
+    "concurrent",       # Concurrent execution
+    "_thread",          # Low-level threading
+
+    # ==========================================================================
+    # Low-level access - can bypass Python safety
+    # ==========================================================================
+    "ctypes",           # C interface - can do anything
+    "cffi",             # C FFI - similar to ctypes
+    "_ctypes",          # ctypes internals
+    "gc",               # Garbage collector manipulation
+    "inspect",          # Code introspection (sandbox escape risk)
+    "dis",              # Bytecode disassembly
+    "traceback",        # Stack inspection
+
+    # ==========================================================================
+    # Platform/OS specific - system information and manipulation
+    # ==========================================================================
+    "platform",         # Platform information
+    "resource",         # Resource limits
+    "sysconfig",        # System configuration
+    "posix",            # POSIX interface
+    "nt",               # Windows interface
+    "msvcrt",           # Windows C runtime
+    "winreg",           # Windows registry
+    "pwd",              # Password database
+    "grp",              # Group database
+    "spwd",             # Shadow password database
+
+    # ==========================================================================
+    # Debugging - can inspect/modify running code
+    # ==========================================================================
+    "pdb",              # Debugger
+    "bdb",              # Debugger base
+    "faulthandler",     # Fault handler
+    "trace",            # Tracing
+    "profile",          # Profiling
+    "cProfile",         # C profiling
+    "pstats",           # Profile statistics
+
+    # ==========================================================================
+    # Builtins module - prohibit the module object itself
+    # ==========================================================================
+    # The builtins module object gives access to all builtins including
+    # dangerous ones like eval, exec, open. We prohibit the module object
+    # but allow individual safe builtins (int, str, list, etc.) via
+    # PROHIBITED_BUILTINS below.
+    "builtins",
+
+})
+
+# =============================================================================
+# Prohibited Builtins (Specific Dangerous Functions)
+# =============================================================================
+#
+# These specific builtin functions are prohibited even though most builtins
+# (int, str, list, dict, etc.) are safe. This catches direct references to
+# dangerous builtins in function globals.
+#
+# Note: This only catches cases where the builtin is explicitly referenced,
+# not implicit usage. For example:
+#   - `fn = eval; fn(...)` - CAUGHT (eval is in function globals)
+#   - `eval(...)` - NOT caught (eval resolved at runtime from builtins)
+#
+# Real sandboxing of builtin access happens server-side.
+
+PROHIBITED_BUILTINS = frozenset({
+    "eval",             # Execute arbitrary code from string
+    "exec",             # Execute arbitrary code
+    "compile",          # Compile source to code object
+    "__import__",       # Dynamic imports
+    "open",             # File access
+    "input",            # Interactive input (can hang server)
+    "breakpoint",       # Debugger
+    "help",             # Interactive help (can hang server)
+    "memoryview",       # Low-level memory access
+    "globals",          # Access to global namespace
+    "locals",           # Access to local namespace
+    "vars",             # Access to object's __dict__
+    "dir",              # Object introspection
+    "getattr",          # Attribute access (can bypass restrictions)
+    "setattr",          # Attribute modification
+    "delattr",          # Attribute deletion
+})
+
+
+def _get_top_level_module(module_name: str) -> Optional[str]:
+    """Extract the top-level module name from a fully qualified module name.
+
+    Args:
+        module_name: The fully qualified module name (e.g., 'torch.nn.functional')
+
+    Returns:
+        The top-level module name (e.g., 'torch'), or None if invalid.
+    """
+    if module_name is None:
+        return None
+    if not isinstance(module_name, str):
+        return None
+    dot_idx = module_name.find(".")
+    if dot_idx == -1:
+        return module_name
+    return module_name[:dot_idx]
+
 
 def _is_whitelisted_module(module_name: str) -> bool:
     """Check if a module is in the server whitelist.
 
-    A module is considered whitelisted if it or any of its parent packages
-    are in the whitelist. For example, if 'torch' is whitelisted, then
-    'torch.nn' and 'torch.nn.functional' are also whitelisted.
+    A module is considered whitelisted if its top-level package is in the
+    whitelist. For example, if 'torch' is whitelisted, then 'torch.nn' and
+    'torch.nn.functional' are also whitelisted.
 
     Args:
         module_name: The fully qualified module name (e.g., 'torch.nn.functional')
@@ -87,34 +285,58 @@ def _is_whitelisted_module(module_name: str) -> bool:
     Returns:
         True if the module is whitelisted, False otherwise.
     """
-    if module_name is None:
-        return False
-    if not isinstance(module_name, str):
-        return False
-    # Fast path: check if the top-level package is whitelisted
-    dot_idx = module_name.find(".")
-    if dot_idx == -1:
-        top_level = module_name
-    else:
-        top_level = module_name[:dot_idx]
-    return top_level in SERVER_MODULES_WHITELIST
+    top_level = _get_top_level_module(module_name)
+    return top_level in SERVER_MODULES_WHITELIST if top_level else False
+
+
+def _is_prohibited_module(module_name: str) -> bool:
+    """Check if a module is in the prohibited blacklist.
+
+    A module is considered prohibited if its top-level package is in the
+    blacklist. For example, if 'os' is prohibited, then 'os.path' is also
+    prohibited.
+
+    Args:
+        module_name: The fully qualified module name (e.g., 'os.path')
+
+    Returns:
+        True if the module is prohibited, False otherwise.
+    """
+    top_level = _get_top_level_module(module_name)
+    return top_level in PROHIBITED_MODULES if top_level else False
 
 
 def _should_pickle_by_reference(obj: Any) -> bool:
     """Determine if an object should be pickled by reference or by value.
 
-    This callback is passed to cloudpickle to control serialization behavior.
-    Objects from whitelisted modules are pickled by reference (just the import
-    path), while objects from non-whitelisted modules are pickled by value
-    (source code for functions, full state for classes).
+    This callback is passed to cloudpickle to control serialization behavior:
+    - Objects from PROHIBITED modules raise PicklingProhibitedError
+    - Objects from WHITELISTED modules are pickled by reference (import path)
+    - Objects from other modules are pickled by value (source code)
 
     Args:
         obj: The object being pickled.
 
     Returns:
         True if the object should be pickled by reference, False for by value.
+
+    Raises:
+        PicklingProhibitedError: If the object is from a prohibited module.
     """
     module = getattr(obj, "__module__", None)
+    obj_name = getattr(obj, "__name__", repr(obj))
+
+    # Check blacklist first - prohibited modules raise an error
+    if _is_prohibited_module(module):
+        raise PicklingProhibitedError(
+            f"Cannot serialize '{obj_name}' from module '{module}'. "
+            f"This module is prohibited for security reasons. "
+            f"Code sent to NDIF servers cannot use modules that perform "
+            f"file system operations, process execution, network access, "
+            f"or other potentially dangerous operations."
+        )
+
+    # Check whitelist - whitelisted modules are pickled by reference
     return _is_whitelisted_module(module)
 
 
@@ -151,6 +373,65 @@ class CustomCloudPickler(cloudpickle.Pickler):
             by_source=True,
             pickle_by_reference=_should_pickle_by_reference,
         )
+
+    def reducer_override(self, obj):
+        """Override reducer to check for prohibited modules.
+
+        This intercepts all objects being pickled and checks if they are
+        modules (or from modules) that are prohibited. This catches cases
+        that the pickle_by_reference callback misses, such as module objects
+        in function globals.
+
+        Args:
+            obj: The object being pickled.
+
+        Returns:
+            NotImplemented to use default handling, or a reduction tuple.
+
+        Raises:
+            PicklingProhibitedError: If the object is a prohibited module.
+        """
+        import types
+
+        # Check if this is a module object from the prohibited list
+        if isinstance(obj, types.ModuleType):
+            module_name = getattr(obj, "__name__", "")
+            if _is_prohibited_module(module_name):
+                raise PicklingProhibitedError(
+                    f"Cannot serialize module '{module_name}'. "
+                    f"This module is prohibited for security reasons. "
+                    f"Code sent to NDIF servers cannot use modules that perform "
+                    f"file system operations, process execution, network access, "
+                    f"or other potentially dangerous operations."
+                )
+
+        # Check if this is a function/method from a prohibited module
+        # This catches things like os.getcwd, subprocess.run, etc.
+        if callable(obj) and hasattr(obj, "__module__"):
+            obj_module = getattr(obj, "__module__", None) or ""
+            obj_name = getattr(obj, "__name__", repr(obj))
+
+            # Special handling for builtins - only block specific dangerous ones
+            if obj_module == "builtins":
+                if obj_name in PROHIBITED_BUILTINS:
+                    raise PicklingProhibitedError(
+                        f"Cannot serialize builtin '{obj_name}'. "
+                        f"This builtin function is prohibited for security reasons. "
+                        f"Code sent to NDIF servers cannot use dangerous builtins "
+                        f"like eval, exec, open, compile, or __import__."
+                    )
+                # Safe builtins (int, str, list, etc.) are allowed
+            elif _is_prohibited_module(obj_module):
+                raise PicklingProhibitedError(
+                    f"Cannot serialize '{obj_name}' from module '{obj_module}'. "
+                    f"This module is prohibited for security reasons. "
+                    f"Code sent to NDIF servers cannot use modules that perform "
+                    f"file system operations, process execution, network access, "
+                    f"or other potentially dangerous operations."
+                )
+
+        # Delegate to parent's reducer_override for all other handling
+        return super().reducer_override(obj)
 
     def persistent_id(self, obj: Any) -> Optional[str]:
         """Return a persistent ID for objects that shouldn't be fully serialized.

@@ -607,7 +607,152 @@ def test_empty_function():
 
 
 # =============================================================================
-# Test 20: Imported function in model trace
+# Test 20: Prohibited modules blacklist (security)
+# =============================================================================
+
+
+def test_prohibited_module_os():
+    """Test that functions using 'os' module are blocked."""
+    from cloudpickle import PicklingProhibitedError
+    import os
+
+    def dangerous_func():
+        return os.getcwd()
+
+    with pytest.raises(PicklingProhibitedError) as exc_info:
+        dumps(dangerous_func)
+    assert "os" in str(exc_info.value)
+    assert "prohibited" in str(exc_info.value).lower()
+
+
+def test_prohibited_module_subprocess():
+    """Test that functions using 'subprocess' module are blocked."""
+    from cloudpickle import PicklingProhibitedError
+    import subprocess
+
+    def dangerous_func():
+        return subprocess.run(["echo", "hello"])
+
+    with pytest.raises(PicklingProhibitedError) as exc_info:
+        dumps(dangerous_func)
+    assert "subprocess" in str(exc_info.value)
+
+
+def test_prohibited_module_socket():
+    """Test that functions using 'socket' module are blocked."""
+    from cloudpickle import PicklingProhibitedError
+    import socket
+
+    def dangerous_func():
+        return socket.gethostname()
+
+    with pytest.raises(PicklingProhibitedError) as exc_info:
+        dumps(dangerous_func)
+    assert "socket" in str(exc_info.value)
+
+
+def test_prohibited_module_shutil():
+    """Test that functions using 'shutil' module are blocked."""
+    from cloudpickle import PicklingProhibitedError
+    import shutil
+
+    def dangerous_func():
+        return shutil.which("python")
+
+    with pytest.raises(PicklingProhibitedError) as exc_info:
+        dumps(dangerous_func)
+    assert "shutil" in str(exc_info.value)
+
+
+def test_whitelisted_module_torch():
+    """Test that functions using whitelisted modules work fine."""
+    def safe_func():
+        return torch.zeros(3)
+
+    # Should not raise - torch is whitelisted
+    data = dumps(safe_func)
+    restored = loads(data)
+    assert torch.allclose(restored(), torch.zeros(3))
+
+
+def test_whitelisted_module_math():
+    """Test that functions using math module work fine."""
+    import math
+
+    def safe_func():
+        return math.sqrt(4)
+
+    # Should not raise - math is whitelisted
+    data = dumps(safe_func)
+    restored = loads(data)
+    assert restored() == 2.0
+
+
+def test_prohibited_builtin_eval():
+    """Test that functions referencing 'eval' builtin are blocked."""
+    from cloudpickle import PicklingProhibitedError
+
+    # Capture eval as a closure variable
+    dangerous_eval = eval
+
+    def dangerous_func():
+        return dangerous_eval("1 + 1")
+
+    with pytest.raises(PicklingProhibitedError) as exc_info:
+        dumps(dangerous_func)
+    assert "eval" in str(exc_info.value)
+
+
+def test_prohibited_builtin_exec():
+    """Test that functions referencing 'exec' builtin are blocked."""
+    from cloudpickle import PicklingProhibitedError
+
+    dangerous_exec = exec
+
+    def dangerous_func():
+        dangerous_exec("x = 1")
+
+    with pytest.raises(PicklingProhibitedError) as exc_info:
+        dumps(dangerous_func)
+    assert "exec" in str(exc_info.value)
+
+
+def test_prohibited_builtin_open():
+    """Test that functions referencing 'open' builtin are blocked.
+
+    Note: open() comes from the _io module (C implementation), not builtins.
+    """
+    from cloudpickle import PicklingProhibitedError
+
+    dangerous_open = open
+
+    def dangerous_func():
+        return dangerous_open("/etc/passwd")
+
+    with pytest.raises(PicklingProhibitedError) as exc_info:
+        dumps(dangerous_func)
+    # open comes from _io module, not builtins
+    assert "open" in str(exc_info.value) or "_io" in str(exc_info.value)
+
+
+def test_safe_builtins_allowed():
+    """Test that safe builtins like int, str, list are allowed."""
+    # These should all work fine
+    safe_int = int
+    safe_str = str
+    safe_list = list
+
+    def safe_func():
+        return safe_int("42"), safe_str(123), safe_list((1, 2, 3))
+
+    # Should not raise - these are safe builtins
+    data = dumps(safe_func)
+    restored = loads(data)
+    assert restored() == (42, "123", [1, 2, 3])
+
+
+# =============================================================================
+# Test 21: Imported function in model trace
 # =============================================================================
 
 
